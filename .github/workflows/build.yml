@@ -1,0 +1,252 @@
+name: Build FanchmWrt for XG-040G-MD
+
+permissions:
+  contents: write
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: "SSH connection to Actions"
+        required: false
+        default: false
+        type: boolean
+      clean:
+        description: "Clean build (clear ccache)"
+        required: false
+        default: false
+        type: boolean
+      verbose:
+        description: "Verbose build log"
+        required: false
+        default: true
+        type: boolean
+  schedule:
+    - cron: "0 18 * * *"  # 每天北京时间凌晨2点自动编译
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+      - 'config/**'
+      - 'patches/**'
+      - 'scripts/**'
+
+env:
+  REPO_URL: https://github.com/fanchmwrt/fanchmwrt.git
+  REPO_BRANCH: main
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: config/xg-040g-md.config
+  CUSTOM_SCRIPT: scripts/custom.sh
+  UPLOAD_RELEASE: true
+  UPLOAD_BIN_DIR: false
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+          g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+          libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5 \
+          libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lrzsz mkisofs msmtp \
+          nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+          python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+          upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+        sudo pip3 install --upgrade pip
+        sudo pip3 install urllib3 requests
+
+    - name: Clone source code
+      run: |
+        echo "开始克隆 FanchmWrt 源码..."
+        git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+        cd openwrt
+        echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
+        echo "源码克隆完成"
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && cp -f $FEEDS_CONF $OPENWRT_PATH/feeds.conf.default
+        chmod +x $GITHUB_WORKSPACE/scripts/*.sh 2>/dev/null || true
+
+    - name: Update feeds
+      run: |
+        echo "开始更新 feeds..."
+        cd $OPENWRT_PATH
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a -f
+        echo "Feeds 更新完成"
+
+    - name: Apply device patches & custom packages
+      run: |
+        cd $GITHUB_WORKSPACE
+        chmod +x scripts/custom.sh
+        bash scripts/custom.sh
+      env:
+        OPENWRT_PATH: ${{ env.OPENWRT_PATH }}
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && cp -rf files $OPENWRT_PATH/
+        [ -e $CONFIG_FILE ] && cp -f $CONFIG_FILE $OPENWRT_PATH/.config
+        cd $OPENWRT_PATH
+        make defconfig
+        echo "配置加载完成"
+
+    - name: Download packages
+      run: |
+        echo "开始下载源码包..."
+        cd $OPENWRT_PATH
+        make download -j$(nproc) V=s
+        find dl -size -1024c -delete
+        echo "源码包下载完成"
+
+    - name: Restore ccache
+      uses: actions/cache/restore@v4
+      id: restore-ccache
+      with:
+        path: .ccache
+        key: ${{ runner.os }}-ccache-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+
+    - name: Restore dl cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.OPENWRT_PATH }}/dl
+        key: ${{ runner.os }}-dl-${{ hashFiles(format('{0}/feeds.conf.default', env.OPENWRT_PATH)) }}
+        restore-keys: |
+          ${{ runner.os }}-dl-
+
+    - name: Compile firmware
+      id: compile
+      run: |
+        cd $OPENWRT_PATH
+        echo "========================================"
+        echo "开始编译固件，时间: $(date)"
+        echo "========================================"
+        START_TIME=$(date +%s)
+        export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+        export CCACHE_MAXSIZE="5G"
+        ccache -M 5G
+        ccache -z
+        BUILD_SUCCESS=true
+        if [ "${{ inputs.verbose }}" = "true" ]; then
+          make -j$(nproc) V=s 2>&1 | tee build.log || BUILD_SUCCESS=false
+        else
+          make -j$(nproc) 2>&1 | tee build.log || BUILD_SUCCESS=false
+        fi
+        END_TIME=$(date +%s)
+        ELAPSED=$((END_TIME - START_TIME))
+        echo "========================================"
+        echo "编译结束，时间: $(date)"
+        echo "总耗时: $((ELAPSED / 60)) 分 $((ELAPSED % 60)) 秒"
+        echo "========================================"
+        if [ "$BUILD_SUCCESS" = false ]; then
+          echo "❌ 编译失败！"
+          echo ""
+          echo "=== 磁盘使用情况 ==="
+          df -h
+          echo ""
+          echo "=== 最后 100 行编译日志 ==="
+          tail -n 100 build.log
+          exit 1
+        fi
+        ccache -s
+        echo "✅ 编译成功！"
+        echo ""
+        echo "=== 生成的固件文件 ==="
+        cd bin/targets/*/*
+        ls -lh
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "DATE=$(date +"%Y.%m.%d-%H%M%S")" >> $GITHUB_ENV
+
+    - name: Save ccache
+      uses: actions/cache/save@v4
+      if: steps.restore-ccache.outputs.cache-hit != 'true' && steps.compile.outputs.status == 'success' && !inputs.clean
+      with:
+        path: .ccache
+        key: ${{ runner.os }}-ccache-${{ github.sha }}
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        cd $OPENWRT_PATH/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+        echo "DEVICE=nokia_xg-040g-md" >> $GITHUB_ENV
+        echo ""
+        echo "=== 最终固件文件 ==="
+        ls -lh
+
+    - name: Upload firmware artifacts
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success'
+      with:
+        name: FanchmWrt_${{ env.DEVICE }}_${{ env.DATE }}
+        path: ${{ env.FIRMWARE_PATH }}/*
+
+    - name: Generate release tag
+      id: tag
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
+      run: |
+        echo "release_tag=FanchmWrt-${{ env.DATE }}" >> $GITHUB_OUTPUT
+        cat <<EOF > release.md
+        ## FanchmWrt for Nokia XG-040G-MD
+        
+        - 设备型号: Nokia XG-040G-MD
+        - 编译时间: $(date +"%Y-%m-%d %H:%M")
+        - 内核版本: 6.12
+        - 源码: FanchmWrt official
+        - 设备支持: Based on ImmortalWrt official
+        
+        **默认功能:**
+        - ✅ FanchmWrt 核心功能 (fwx 上网行为管理)
+        - ✅ LuCI 中文界面
+        - ✅ USB 支持
+        - ✅ 2.5G 网口支持
+        EOF
+
+    - name: Publish release
+      uses: ncipollo/release-action@v1
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
+      with:
+        tag: ${{ steps.tag.outputs.release_tag }}
+        name: FanchmWrt for XG-040G-MD ${{ env.DATE }}
+        bodyFile: release.md
+        artifacts: ${{ env.FIRMWARE_PATH }}/*
+        allowUpdates: true
+        removesArtifacts: true
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Cleanup old releases
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
+      uses: dev-drprasad/delete-older-releases@v0.3.2
+      with:
+        keep_latest: 20
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Cleanup old workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        retain_days: 7
+        keep_minimum_runs: 5
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
